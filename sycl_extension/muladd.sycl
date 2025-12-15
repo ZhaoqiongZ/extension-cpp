@@ -1,0 +1,107 @@
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <ATen/Operators.h>
+#include <torch/all.h>
+#include <torch/library.h>  // <--- 核心：只用 library.h，不用 extension.h
+
+// 如果开启了 Limited API，这里需要包含 Python.h 并定义宏
+// Setup.py 里如果有 /DPy_LIMITED_API=0x03090000，这里通常也会生效
+// 但为了安全，显式包含 Python 头文件用于定义入口
+#include <Python.h>
+
+namespace sycl_extension {
+
+// ==========================================================
+// 1. Kernel (SYCL 核心逻辑，不用改)
+// ==========================================================
+static void muladd_kernel(
+    int numel, const float* a, const float* b, float c, float* result,
+    const sycl::nd_item<1>& item) {
+    int idx = item.get_global_id(0);
+    if (idx < numel) {
+        result[idx] = a[idx] * b[idx] + c;
+    }
+}
+
+class MulAddKernelFunctor {
+public:
+    MulAddKernelFunctor(int _numel, const float* _a, const float* _b, float _c, float* _result)
+        : numel(_numel), a(_a), b(_b), c(_c), result(_result) {}
+    void operator()(const sycl::nd_item<1>& item) const {
+        muladd_kernel(numel, a, b, c, result, item);
+    }
+
+private:
+    int numel;
+    const float* a;
+    const float* b;
+    float c;
+    float* result;
+};
+
+// ==========================================================
+// 2. Wrapper (包装函数，不用改)
+// ==========================================================
+at::Tensor mymuladd_xpu(const at::Tensor& a, const at::Tensor& b, double c) {
+    TORCH_CHECK(a.sizes() == b.sizes(), "a and b must have the same shape");
+    TORCH_CHECK(a.dtype() == at::kFloat, "a must be a float tensor");
+    TORCH_CHECK(b.dtype() == at::kFloat, "b must be a float tensor");
+    TORCH_CHECK(a.device().is_xpu(), "a must be an XPU tensor");
+    TORCH_CHECK(b.device().is_xpu(), "b must be an XPU tensor");
+
+    at::Tensor a_contig = a.contiguous();
+    at::Tensor b_contig = b.contiguous();
+    at::Tensor result = at::empty_like(a_contig);
+
+    const float* a_ptr = a_contig.data_ptr<float>();
+    const float* b_ptr = b_contig.data_ptr<float>();
+    float* res_ptr = result.data_ptr<float>();
+    int numel = a_contig.numel();
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue();
+    constexpr int threads = 256;
+    int blocks = (numel + threads - 1) / threads;
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<MulAddKernelFunctor>(
+            sycl::nd_range<1>(blocks * threads, threads),
+            MulAddKernelFunctor(numel, a_ptr, b_ptr, static_cast<float>(c), res_ptr)
+        );
+    });
+
+    return result;
+}
+
+// ==========================================================
+// 3. Registration (PyTorch Library 注册，不用改)
+// ==========================================================
+TORCH_LIBRARY(sycl_extension, m) {
+  m.def("mymuladd(Tensor a, Tensor b, float c) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(sycl_extension, XPU, m) {
+    m.impl("mymuladd", &mymuladd_xpu);
+}
+
+} // namespace sycl_extension
+
+// ==========================================================
+// 4. Windows Linker Fix (关键！)
+// 手动实现 PyInit__C，替代 Pybind11
+// ==========================================================
+extern "C" {
+    // 必须导出该符号
+    #ifdef _WIN32
+    __declspec(dllexport)
+    #endif
+    PyObject* PyInit__C(void) {
+        static struct PyModuleDef moduledef = {
+            PyModuleDef_HEAD_INIT,
+            "_C",                 // 模块名，必须与 setup.py 一致
+            "XPU Extension Shim", // 文档
+            -1,                   // 模块状态大小
+            NULL                  // 方法列表 (我们不通过 Python C-API 暴露方法，全靠 torch ops)
+        };
+        return PyModule_Create(&moduledef);
+    }
+}
